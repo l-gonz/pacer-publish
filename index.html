@@ -129,7 +129,6 @@
   /* the segment you're physically in right now: subtle blue tint + a left edge */
   .bd .curseg td{background:rgba(74,163,255,.10)}
   .bd .curseg td:first-child{box-shadow:inset 2px 0 0 var(--blue)}
-  .bdkey{font-size:.72rem;color:var(--dim);margin:2px 2px 10px;text-align:center}
   /* hamburger + sidebar drawer */
   .hamb{width:auto;background:none;border:none;padding:6px 10px 6px 2px;font-size:1.5rem;
     line-height:1;color:var(--text)}
@@ -211,9 +210,6 @@
   </div><!-- /tabStatus -->
 
   <div id="tabBreak" class="tab">
-    <div class="bdkey">header = stage time (<b>Good</b> / <b>Real</b> / <b>Bad</b> + <b class="act">act</b>, h:mm);
-      columns = pace (min/km). Last row of each stage = aid-time budget vs time spent at the
-      checkpoint. Tap a checkpoint to expand its segments.</div>
     <div id="stages"></div>
   </div>
 </div>
@@ -706,6 +702,7 @@ function renderBreakdown(){
       const inSeg = S.t0 && curKm>=s.km0 && curKm<s.km1;
       rows+="<tr"+(inSeg?" class='curseg'":"")+"><td>"+(inSeg?"◉ ":"")+
         s.km0.toFixed(1)+" · <span class='"+gradeCls(s.grade)+"'>"+
+        (s.grade>0?"+":"")+s.grade.toFixed(0)+"%</span></td>"+
         "<td>"+fmtDist(segDistKm)+"</td>"+
         "<td>"+paceCell(s.pace.good)+"</td><td>"+paceCell(s.pace.realistic)+
         "</td><td>"+paceCell(s.pace.bad)+"</td><td class='"+segActCls+"'>"+a+"</td></tr>";
