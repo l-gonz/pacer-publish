@@ -118,12 +118,17 @@
   .bd th,.bd td{padding:5px 8px;text-align:right;border-top:1px solid var(--line)}
   .bd th{color:var(--dim);font-weight:600;text-transform:uppercase;font-size:.66rem;letter-spacing:.5px}
   .bd td:first-child,.bd th:first-child{text-align:left}
+  /* dist (2nd) column hugs the km·grade column rather than the pace block */
+  .bd td:nth-child(2),.bd th:nth-child(2){text-align:left;color:var(--dim);padding-left:2px}
   .bd .act,.bd .pg,.bd .pa,.bd .pr{font-weight:700}
   .bd .act{color:var(--blue)}
   .bd .up{color:var(--amber)} .bd .dn{color:var(--green)}
   /* checkpoint dwell row: aid budget vs time actually spent at the aid station */
   .bd .cprow td{background:var(--panel);color:var(--dim);font-size:.74rem}
   .bd .cprow td:first-child{color:var(--text);font-weight:600}
+  /* the segment you're physically in right now: subtle blue tint + a left edge */
+  .bd .curseg td{background:rgba(74,163,255,.10)}
+  .bd .curseg td:first-child{box-shadow:inset 2px 0 0 var(--blue)}
   .bdkey{font-size:.72rem;color:var(--dim);margin:2px 2px 10px;text-align:center}
   /* hamburger + sidebar drawer */
   .hamb{width:auto;background:none;border:none;padding:6px 10px 6px 2px;font-size:1.5rem;
@@ -687,6 +692,7 @@ function renderBreakdown(){
         "<br><span class='"+stageCls+"'>"+(ta!=null? "act "+fmtMin(ta) : "—")+"</span></div>";
     det.appendChild(sum);
 
+    const curKm=S.km||0;
     let rows="<table class='bd'><tr><th>km · grade</th><th>dist</th><th>Good</th><th>Real</th><th>Bad</th><th>Act</th></tr>";
     for(const s of st.segs){
       const segDistKm=s.km1-s.km0;
@@ -695,8 +701,11 @@ function renderBreakdown(){
       const segActPace=(sm0!=null && sm1!=null && segDistKm>0.02)?(sm1-sm0)/segDistKm:null;
       const a = segActPace!=null ? paceCell(segActPace) : "–";
       const segActCls = actCls(segActPace, s.pace.realistic, s.pace.bad);
-      rows+="<tr><td>"+s.km0.toFixed(1)+" · <span class='"+gradeCls(s.grade)+"'>"+
-        (s.grade>0?"+":"")+s.grade.toFixed(0)+"%</span></td>"+
+      // mark the segment we're physically in (no "here" text — just the dot, like the
+      // checkpoint row). Half-open range so a clipped boundary hits only one stage.
+      const inSeg = S.t0 && curKm>=s.km0 && curKm<s.km1;
+      rows+="<tr"+(inSeg?" class='curseg'":"")+"><td>"+(inSeg?"◉ ":"")+
+        s.km0.toFixed(1)+" · <span class='"+gradeCls(s.grade)+"'>"+
         "<td>"+fmtDist(segDistKm)+"</td>"+
         "<td>"+paceCell(s.pace.good)+"</td><td>"+paceCell(s.pace.realistic)+
         "</td><td>"+paceCell(s.pace.bad)+"</td><td class='"+segActCls+"'>"+a+"</td></tr>";
