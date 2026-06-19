@@ -116,7 +116,6 @@
   .stage .skm .up{color:var(--amber)} .stage .skm .dn{color:var(--green)}
   .stage .scut{color:var(--amber);margin-right:10px}
   .stage .scut.warn{color:var(--red)}
-  .stage .slabel{color:var(--dim);font-size:.72rem;font-weight:600}
   .stage .stimes{font-variant-numeric:tabular-nums;font-size:.82rem;text-align:right;grid-column:2;grid-row:1/3}
   .bd{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;font-size:.8rem}
   .bd th,.bd td{padding:5px 8px;text-align:right;border-top:1px solid var(--line)}
@@ -478,10 +477,11 @@ let S = loadState();
 function loadState(){
   let s=null;
   try{ s=JSON.parse(localStorage.getItem(KEY)); }catch(e){}
-  if(!s) s={ t0:null, km:0, history:[], track:"cont", scen:"auto", lastFix:null };
+  if(!s) s={ t0:null, km:0, history:[], track:"cont", scen:"auto", lastFix:null, snapshots:[] };
   // migrate the old auto/manual `mode` field to the new `track` interval field
   if(s.track==null){ s.track = (s.mode==="manual") ? "manual" : "cont"; }
   delete s.mode;
+  if(!Array.isArray(s.snapshots)) s.snapshots=[];   // periodic good/real/bad diff log
   return s;
 }
 function save(){ localStorage.setItem(KEY, JSON.stringify(S)); }
@@ -499,7 +499,7 @@ function switchRoute(key){
   MATCHER = RouteMatch.makeMatcher(DATA.route);   // new route -> new matcher/vote state
   // fresh race state for the new route; keep tracking/scenario preferences
   stopTracking();
-  S = { t0:null, km:0, history:[], track:S.track, scen:S.scen, lastFix:null };
+  S = { t0:null, km:0, history:[], track:S.track, scen:S.scen, lastFix:null, snapshots:[] };
   save();
   openStages = {}; localStorage.setItem("tdlpacer.open","{}");
   buildCpList();
@@ -646,6 +646,77 @@ function startWatch(){
   {enableHighAccuracy:true, maximumAge:2000, timeout:20000});
 }
 function stopWatch(){ if(watchId!=null){navigator.geolocation.clearWatch(watchId);watchId=null;} }
+
+// ---------- native background GPS (Capacitor) ----------
+// In a Capacitor native shell the browser's watchPosition is replaced by the
+// Transistor background-geolocation plugin, which keeps firing fixes with the
+// screen off / app backgrounded (foreground service + persistent notification).
+// The pacing brain doesn't move: each native fix runs through the SAME snapKm +
+// gatedApply path as the web watch. See docs/NATIVE-APP-MIGRATION.md §5.6.
+function isNative(){ return !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform()); }
+let nativeStarted=false;
+// Resolve the Transistor plugin. Under Capacitor the bridge is registered at
+// Capacitor.Plugins.BackgroundGeolocation (NOT the bare global window.BackgroundGeolocation,
+// which is the Cordova shape). We talk to that raw bridge directly: the rich JS wrapper's
+// onLocation/ready/start are thin sugar over NativeModule.addListener("location",…) /
+// NativeModule.ready({options}) / NativeModule.start(). Driving the bridge avoids bundling
+// the wrapper (and its tslib / @capacitor/core imports) into this single-file PWA.
+function nativeBG(){
+  return (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.BackgroundGeolocation)
+      || window.BackgroundGeolocation || null;
+}
+// Heartbeat cadence (seconds) for a guaranteed fix even while the SDK thinks we're
+// stationary. We always want a position roughly every 2 min so a long stop never leaves
+// a gap in the cutoff math — this is fixed, independent of the app's interval dropdown
+// (which only drives the WEB poll; native self-paces via the plugin, see applyTracking).
+const NATIVE_HEARTBEAT_SECS = 120;
+function startNative(){
+  const BG = nativeBG();
+  if(!BG){ $("gps").textContent="native GPS plugin missing"; $("gps").className="small warn"; return; }
+  // Normalise a fix from either the "location" event ({location:{coords}}) or a
+  // getCurrentPosition result ({coords}) and run it through the SAME snap+gate path.
+  const handleFix = loc => {
+    const c = (loc && (loc.location || loc)).coords || (loc && loc.location) || loc;
+    if(!c || c.latitude==null){ return; }
+    const {latitude,longitude,accuracy} = c;
+    const s = snapKm(latitude, longitude, S.history.length ? (S.km||0) : null);
+    gatedApply(s, accuracy, "gps");
+  };
+  if(nativeStarted){ BG.start(); return; }
+  // de-dupe listeners across re-applies; .ready() must run exactly once.
+  BG.addListener("location", handleFix);
+  // Heartbeat: fires on NATIVE_HEARTBEAT_SECS even when stationary. The tick itself
+  // carries no fresh GPS, so we force a one-shot getCurrentPosition each beat. The
+  // route_match gate still deadbands true jitter, so a genuine stop won't drift km.
+  BG.addListener("heartbeat", () => {
+    BG.getCurrentPosition({ options: { samples: 1, persist: true, timeout: 30 } })
+      .then(handleFix).catch(()=>{});
+  });
+  $("gps").textContent="native GPS starting…"; $("gps").className="small";
+  BG.ready({ options: {
+    desiredAccuracy: 0,                      // HIGH
+    distanceFilter: 5,                       // metres between fixes
+    heartbeatInterval: NATIVE_HEARTBEAT_SECS,// force a fix every ~2 min even when stopped
+    stopOnTerminate: false,                  // keep recording if the app is killed
+    startOnBoot: true,
+    foregroundService: true,
+    backgroundPermissionRationale: {
+      title: "Allow TDL Pacer to track your race",
+      message: "We record your position to show pace and cutoff buffers with the screen off.",
+      positiveAction: "Allow all the time"
+    },
+    notification: { title: "TDL Pacer", text: "Recording your race position" }
+  }}).then(state => {
+    nativeStarted=true;
+    $("gps").textContent="native GPS ready";
+    if(!state || !state.enabled){ BG.start(); }
+  }).catch(err => {
+    $("gps").textContent="native GPS "+((err&&err.message)?err.message:"error");
+    $("gps").className="small warn";
+  });
+}
+function stopNative(){ const BG=nativeBG(); if(BG && nativeStarted) BG.stop(); }
+
 function oneShot(){
   if(!navigator.geolocation){ $("gps").textContent="no geolocation"; return; }
   if(geoBlockedMsg()){ showGeoErr(null); return; }
@@ -665,11 +736,14 @@ function oneShot(){
 // Polling at an interval lets the GPS chip sleep between fixes (battery), which a
 // continuous watch can't. Always tears down the previous mode first.
 let pollId=null;
-function stopTracking(){ stopWatch(); if(pollId!=null){clearInterval(pollId);pollId=null;} }
+function stopTracking(){ stopWatch(); stopNative(); if(pollId!=null){clearInterval(pollId);pollId=null;} }
 function applyTracking(){
   stopTracking();
   if(!S.t0) return;                 // only track once the race has started
   if(S.track==="manual") return;
+  // Native shell: the bg-geolocation plugin is the fix source for any non-manual
+  // mode (it already self-paces via distanceFilter), so the screen can be off.
+  if(isNative()){ startNative(); return; }
   if(S.track==="cont"){ startWatch(); return; }
   const secs=parseInt(S.track,10);
   if(secs>0){ oneShot(); pollId=setInterval(oneShot, secs*1000); }
@@ -683,6 +757,24 @@ document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==
 // ---------- render ----------
 function bandFor(deltaReal){ // deltaReal vs scenarios at current km (min, negative=ahead)
   return deltaReal;
+}
+
+// Periodic snapshot of progress for the export: one record per SNAPSHOT_MIN-minute bucket
+// of elapsed race time, holding km reached and the diff (min behind, − = ahead) vs each
+// scenario at that km. Idempotent within a bucket (render ticks every second).
+const SNAPSHOT_MIN = 20;
+function maybeSnapshot(elapsedMin, km, dG, dR, dB){
+  if(!S.t0) return;
+  const bucket = Math.floor(elapsedMin / SNAPSHOT_MIN);
+  const last = S.snapshots[S.snapshots.length-1];
+  if(last && last.bucket===bucket) return;            // already captured this 20-min slot
+  S.snapshots.push({
+    bucket, t: Date.now(), elapsed_min: Math.round(elapsedMin),
+    km: +km.toFixed(3),
+    d_good: +dG.toFixed(1), d_real: +dR.toFixed(1), d_bad: +dB.toFixed(1)
+  });
+  if(S.snapshots.length>1000) S.snapshots=S.snapshots.slice(-1000);  // ~14 days @20min
+  save();
 }
 function render(){
   const now=Date.now();
@@ -714,6 +806,11 @@ function render(){
   $("dGood").textContent=fmtSigned(dG); $("dGood").className=dG<=0?"ahead":"behind";
   $("dReal").textContent=fmtSigned(dR); $("dReal").className=dR<=0?"ahead":"behind";
   $("dBad").textContent =fmtSigned(dB); $("dBad").className =dB<=0?"ahead":"behind";
+
+  // Log a good/real/bad diff snapshot every SNAPSHOT_MIN of elapsed race time, for the
+  // export. render() ticks ~1/s, so we gate on the elapsed-minute bucket: push at most one
+  // per bucket boundary. dG/dR/dB are minutes behind each scenario (negative = ahead).
+  maybeSnapshot(elapsedMin, km, dG, dR, dB);
 
   // band: ahead of good / good-real / real-bad / behind bad
   let cls="g",label="ON GOOD";
@@ -893,7 +990,7 @@ function renderBreakdown(){
         st.km0.toFixed(1)+"–"+st.km1.toFixed(1)+" · "+stageDistKm.toFixed(1)+" km"+
         (up!=null? " · <span class='up'>+"+Math.round(up)+"</span>/<span class='dn'>−"+
           Math.round(dn)+"</span>m" : "")+"</div></div>"+
-      "<div class='stimes'><span class='slabel'>plan G/R/B</span> "+
+      "<div class='stimes'>"+
         fmtMin(tg)+" / "+fmtMin(tr)+" / "+fmtMin(tb)+
         "<br>"+cutLine+"<span class='"+stageCls+"'>"+(ta!=null? "act "+fmtMin(ta) : "—")+"</span></div>";
     det.appendChild(sum);
@@ -1009,7 +1106,7 @@ $("tabBreakBtn").onclick=()=>showTab("break");
 $("btnUpdate").onclick=()=>{ closeDrawer(); oneShot(); };
 $("btnStart").onclick=()=>{
   if(S.t0 && !confirm("Race already started "+clockOf(S.t0)+". Restart timer to NOW?")) return;
-  S.t0=Date.now(); S.history=[]; save(); applyTracking(); reqWake(); closeDrawer(); render();
+  S.t0=Date.now(); S.history=[]; S.snapshots=[]; save(); applyTracking(); reqWake(); closeDrawer(); render();
 };
 $("btnMenu").onclick=openDrawer;
 $("btnClose").onclick=closeDrawer;
@@ -1043,34 +1140,103 @@ $("btnManualKm").onclick=()=>{
   const v=prompt("Current km along route (0–"+DATA.total_km+"):", (S.km||0).toFixed(1));
   const k=parseFloat(v); if(!isNaN(k)) applyKm(Math.max(0,Math.min(DATA.total_km,k)),0,null,"manual");
 };
-// Dump everything needed to debug a run after the fact: the active state S (t0, km,
-// and the timestamped GPS history), the route key/version for context, plus the raw
-// localStorage keys. On Chrome/Android this opens the share sheet (hand off to Drive /
-// Gmail / Files); otherwise it falls back to a plain file download.
-$("btnExport").onclick=async ()=>{
-  const dump={
-    exported_at: new Date().toISOString(),
-    route: routeKey,
-    version: (DATA && DATA.version) || (BUNDLE && BUNDLE.version) || null,
-    state: S,
-    raw: { state: localStorage.getItem(KEY),
-           route: localStorage.getItem(ROUTE_KEY),
-           open: localStorage.getItem("tdlpacer.open") }
-  };
-  const text=JSON.stringify(dump,null,2);
+// ---------- export run data (CSV) ----------
+// Two CSV blocks in one file: (A) per-subsegment planned vs actual pace — the same fine
+// segments as the breakdown tab, with the Good/Real/Bad planned pace and the actual pace
+// over the part covered so far; (B) the 20-min diff log (min behind/ahead of each scenario).
+//
+// Delimiter is ';' (not ','), and decimals are written with a ',' — this is the format
+// Excel expects on a comma-decimal locale (Spanish/most of Europe), so the file splits into
+// columns AND parses numbers on a plain double-click. The leading "sep=;" line tells Excel
+// the delimiter explicitly. Google Sheets / pandas can still read it when told sep=';'.
+const CSV_SEP=";";
+function num(v, dp){                 // number -> string with comma decimal, or "" for null
+  if(v==null || (typeof v==="number" && !isFinite(v))) return "";
+  const s=(dp==null)? String(v) : Number(v).toFixed(dp);
+  return s.replace(".", ",");
+}
+function csvCell(v){
+  if(v==null) return "";
+  const s=String(v);
+  return new RegExp('["'+CSV_SEP+'\\n]').test(s) ? '"'+s.replace(/"/g,'""')+'"' : s;
+}
+function csvRow(arr){ return arr.map(csvCell).join(CSV_SEP)+"\n"; }
+function buildExportCSV(){
+  const stampISO=new Date().toISOString();
+  let out="sep="+CSV_SEP+"\n";       // Excel delimiter hint (must be the very first line)
+  out += csvRow(["TDL Pacer run export"]);
+  out += csvRow(["exported_at", stampISO]);
+  out += csvRow(["route", routeKey, (BUNDLE.races[routeKey] && BUNDLE.races[routeKey].label)||""]);
+  out += csvRow(["plan_version", (DATA && DATA.version)||""]);
+  out += csvRow(["started_at", S.t0? new Date(S.t0).toISOString() : "(not started)"]);
+  out += csvRow(["current_km", num(S.km||0,2), "of", num(DATA.total_km)]);
+  out += csvRow(["headline_scenario", bestScenario()+(S.scen==="auto"?" (auto)":"")]);
+  out += "\n";
+
+  // (A) per-subsegment planned vs actual
+  out += csvRow(["SUBSEGMENT BREAKDOWN (pace min/km)"]);
+  out += csvRow(["seg","km_from","km_to","len_km","grade_pct",
+                 "plan_good","plan_real","plan_bad","actual","status"]);
+  const curKm=S.km||0;
+  DATA.segments.forEach((seg,i)=>{
+    const upto=Math.min(curKm, seg.km1);
+    const m0=actualMinAt(seg.km0), m1=actualMinAt(upto), dkm=upto-seg.km0;
+    const act=(m0!=null && m1!=null && dkm>0.05) ? (m1-m0)/dkm : null;
+    let status="not reached";
+    if(curKm>=seg.km1-1e-6) status="done";
+    else if(curKm>seg.km0+1e-6) status="in progress";
+    out += csvRow([ i+1, num(seg.km0,2), num(seg.km1,2),
+      num(seg.km1-seg.km0,2), Math.round(seg.grade),
+      num(seg.pace.good,1), num(seg.pace.realistic,1), num(seg.pace.bad,1),
+      num(act,1), status ]);
+  });
+  out += "\n";
+
+  // (B) 20-min diff log (negative = ahead of that scenario)
+  out += csvRow(["TIME-DIFF LOG (every "+SNAPSHOT_MIN+" min; min behind, negative = ahead)"]);
+  out += csvRow(["elapsed_min","clock","km","diff_good","diff_real","diff_bad"]);
+  for(const s of S.snapshots){
+    out += csvRow([ num(s.elapsed_min), clockOf(s.t), num(s.km,2),
+      num(s.d_good,1), num(s.d_real,1), num(s.d_bad,1) ]);
+  }
+  return out;
+}
+
+// Export the run as a CSV. On native (Capacitor) write it to the cache dir and open the
+// system share sheet (Drive / Gmail / Files) via the Share plugin; on the web fall back to
+// navigator.share, then a plain blob download. Surfaces any error in the GPS status line.
+async function doExport(){
+  const text=buildExportCSV();
   const stamp=new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
-  const fname="pacer-run-"+routeKey+"-"+stamp+".json";
-  const file=new File([text],fname,{type:"application/json"});
-  // Prefer the native share sheet on devices that can share files.
+  const fname="pacer-run-"+routeKey+"-"+stamp+".csv";
+
+  if(isNative()){
+    const P=window.Capacitor && window.Capacitor.Plugins;
+    const FS=P && P.Filesystem, Sh=P && P.Share;
+    if(FS && Sh){
+      try{
+        const w=await FS.writeFile({ path:fname, data:text, directory:"CACHE", encoding:"utf8" });
+        await Sh.share({ title:fname, text:"TDL Pacer run data", url:w.uri });
+        return;
+      }catch(e){
+        if(e && (e.message||"").toLowerCase().includes("cancel")) return;  // user dismissed
+        $("gps").textContent="export failed: "+((e&&e.message)?e.message:e); $("gps").className="small warn";
+        return;
+      }
+    }
+    // plugins missing -> fall through to the web path (better than nothing)
+  }
+
+  const file=new File([text],fname,{type:"text/csv"});
   if(navigator.canShare && navigator.canShare({files:[file]})){
     try{ await navigator.share({files:[file],title:fname}); return; }catch(e){ if(e.name==="AbortError") return; }
   }
-  // Fallback: trigger a download.
   const url=URL.createObjectURL(file);
   const a=document.createElement("a"); a.href=url; a.download=fname;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(()=>URL.revokeObjectURL(url),1000);
-};
+}
+$("btnExport").onclick=doExport;
 $("btnReset").onclick=()=>{ if(confirm("Reset all race data?")){ localStorage.removeItem(KEY); S=loadState(); stopTracking(); $("track").value=S.track; render(); } };
 
 // init
@@ -1086,6 +1252,16 @@ $("btnReset").onclick=()=>{ if(confirm("Reset all race data?")){ localStorage.re
     $("routeLbl").style.display="none"; sel.style.display="none";
   }
 })();
+// On the native shell every non-manual interval behaves identically — the bg-geolocation
+// plugin self-paces (see applyTracking), so the WEB interval options are meaningless here.
+// Collapse the dropdown to the two choices that actually differ on native: plugin-tracked
+// vs manual. (The PWA keeps the full interval list, where the rates genuinely change drain.)
+if(isNative()){
+  $("track").innerHTML =
+    '<option value="cont">Background tracking (recommended)</option>'+
+    '<option value="manual">Manual / tap only</option>';
+  if(S.track!=="manual") S.track="cont";   // any old interval value -> plugin tracking
+}
 $("track").value=S.track; $("scenSel").value=S.scen;
 buildCpList();
 refreshSetT0Label();
