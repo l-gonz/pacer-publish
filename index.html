@@ -650,31 +650,67 @@ function bestScenario(){
 // anchor=null (no history yet) to force a global acquisition scan.
 function snapKm(lat,lon,anchor){ return MATCHER.snap(lat,lon,anchor); }
 
+// Extract a fix's OWN timestamp (ms epoch) from whatever shape delivered it, so history is
+// stamped with when the position was MEASURED, not when we processed it (critical for batched
+// native fixes — see applyKm). Handles: web GeolocationPosition (.timestamp ms), the
+// Transistor location ({timestamp: ISO string} or nested under .location), and a raw coords
+// object. Returns null if none present (caller falls back to Date.now()).
+function fixTimeOf(obj){
+  if(!obj) return null;
+  const o = obj.location || obj;             // native event wraps the location
+  let ts = o.timestamp;
+  if(ts==null && o.coords) ts = o.coords.timestamp;
+  if(ts==null) return null;
+  if(typeof ts==="number") return ts;        // web: ms epoch already
+  const ms = Date.parse(ts);                 // native: ISO 8601 string
+  return isNaN(ms) ? null : ms;
+}
+
 // ---------- apply a position fix ----------
-function applyKm(km, off, accuracy, source){
+// `fixT` is the GPS fix's OWN timestamp (ms epoch). It MUST be threaded through from the
+// position object — NOT Date.now() — because the native background-geolocation plugin
+// delivers buffered fixes in batches: when the app is throttled/backgrounded it queues
+// locations and flushes dozens at once, all arriving at one wall-clock instant. Stamping
+// history with Date.now() then collapses a whole stretch of the route into a single time,
+// so per-segment "actual" pace divides real distance by ~0 elapsed → the 0 / 585 / −182
+// min/km garbage seen in the first field test. Using each fix's real time keeps history
+// spread across true wall-clock even when delivery is bursty. Falls back to now() if a
+// caller has no GPS time (manual entry).
+function applyKm(km, off, accuracy, source, fixT){
+  const t = fixT || Date.now();
   S.km=km;
   MATCHER.reset();                           // a committed/manual fix clears retreat votes
   S.offRoute=false;                          // a committed fix means we're on the corridor
-  S.lastFix={t:Date.now(), km, off, acc:accuracy, src:source};
-  if(S.t0) S.history.push({t:Date.now(), km});
-  // keep history bounded
-  if(S.history.length>400) S.history=S.history.slice(-400);
+  S.lastFix={t, km, off, acc:accuracy, src:source};
+  // History must stay sorted in time for the envelope/interpolation; a batch can deliver an
+  // out-of-order fix, so insert by timestamp rather than blindly push.
+  if(S.t0) insertHistory({t, km});
   save(); render();
+}
+// Insert a {t,km} sample keeping S.history sorted ascending by t (bounded to 400). Almost
+// always an append (fixes arrive in time order); the linear back-scan handles the rare
+// out-of-order batch fix cheaply.
+function insertHistory(rec){
+  const H=S.history;
+  let i=H.length;
+  while(i>0 && H[i-1].t > rec.t) i--;
+  H.splice(i,0,rec);
+  if(H.length>400) S.history=H.slice(-400);
 }
 
 // ---------- fix gating (noise rejection) ----------
 // Run a continuous-tracking fix through the gate (off-route reject / deadband / backward-
 // persistence — see route_match.mjs) and apply the decision. One-shot and manual paths call
-// applyKm directly and stay deliberate/unfiltered.
-function gatedApply(snapped, accuracy, source){
+// applyKm directly and stay deliberate/unfiltered. `fixT` = the fix's own GPS timestamp.
+function gatedApply(snapped, accuracy, source, fixT){
   const d=MATCHER.gate(snapped, S.km||0, accuracy);
-  if(d.action==="advance"){ applyKm(d.km, d.off, accuracy, source); return; }
+  if(d.action==="advance"){ applyKm(d.km, d.off, accuracy, source, fixT); return; }
   // hold / reject: update the status fix (so the UI can show off-route) but DON'T record.
   // Latch the off-route state from the gate so render() can freeze the cutoff math and warn.
   S.offRoute = !!d.offRoute;
   const tag = d.action==="reject" ? "-rej"
             : (d.reason==="back-unconfirmed" || d.reason==="fwd-leap-unconfirmed" ? "-hold" : "");
-  S.lastFix={t:Date.now(), km:d.km, off:d.off, acc:accuracy, src:source+tag};
+  S.lastFix={t:fixT||Date.now(), km:d.km, off:d.off, acc:accuracy, src:source+tag};
   render();
 }
 
@@ -703,9 +739,10 @@ function startWatch(){
   if(geoBlockedMsg()){ showGeoErr(null); return; }   // don't bother watching in an insecure context
   watchId=navigator.geolocation.watchPosition(pos=>{
     const {latitude,longitude,accuracy}=pos.coords;
-    // forward-biased snap around current km, then gate for noise (see gatedApply)
+    // forward-biased snap around current km, then gate for noise (see gatedApply). Record
+    // with the fix's OWN timestamp (pos.timestamp), not now() — see applyKm.
     const s=snapKm(latitude,longitude, S.history.length? (S.km||0) : null);
-    gatedApply(s, accuracy, "gps");
+    gatedApply(s, accuracy, "gps", fixTimeOf(pos));
   }, showGeoErr,
   {enableHighAccuracy:true, maximumAge:2000, timeout:20000});
 }
@@ -743,8 +780,11 @@ function startNative(){
     const c = (loc && (loc.location || loc)).coords || (loc && loc.location) || loc;
     if(!c || c.latitude==null){ return; }
     const {latitude,longitude,accuracy} = c;
+    // Record with the fix's OWN timestamp. The plugin flushes BUFFERED fixes in batches when
+    // backgrounded/throttled — without the per-fix time, a whole batch collapses to one instant
+    // and per-segment pace breaks. fixTimeOf reads the location's ISO timestamp. See applyKm.
     const s = snapKm(latitude, longitude, S.history.length ? (S.km||0) : null);
-    gatedApply(s, accuracy, "gps");
+    gatedApply(s, accuracy, "gps", fixTimeOf(loc));
   };
   if(nativeStarted){ BG.start(); return; }
   // de-dupe listeners across re-applies; .ready() must run exactly once.
@@ -790,7 +830,7 @@ function oneShot(){
     // anchored snap + noise gate, same as the continuous watch (interval polling is
     // just a slower watch). First-ever fix has no anchor -> pure global scan.
     const s=snapKm(latitude,longitude, S.history.length? (S.km||0) : null);
-    gatedApply(s,accuracy,"gps1");
+    gatedApply(s,accuracy,"gps1", fixTimeOf(pos));
   }, showGeoErr,
   {enableHighAccuracy:true,maximumAge:0,timeout:20000});
 }
